@@ -3,12 +3,10 @@ module Mine
 using SHA
 using JSON
 
-print("doing\n")
 
-
-#= = = = = = = = = = = = =#
+#=========================#
 #=     Cryptography      =#
-#= = = = = = = = = = = = =#
+#=========================#
 
 function dSHA2(in::String)
     return dSHA2(hex2bytes(in))
@@ -20,9 +18,9 @@ end
 
 
 
-#= = = = = = = = = = = = =#
+#=========================#
 #=    Coinbase Block     =#
-#= = = = = = = = = = = = =#
+#=========================#
 
 mutable struct CoinbaseBlock
     coinb1::String
@@ -30,8 +28,7 @@ mutable struct CoinbaseBlock
     extranonce2_size::Int32
     coinb2::String
     extranonce2
-    CoinbaseBlock(
-        coinb1, extranonce1, extranonce2_size, coinb2) =
+    CoinbaseBlock(coinb1, extranonce1, extranonce2_size, coinb2) =
         new(coinb1, extranonce1, extranonce2_size, coinb2, UInt32(0))
 end
 
@@ -52,11 +49,23 @@ end
 
 
 
+#=========================#
+#=      Merkle root      =#
+#=========================#
+
+function buildMerkelRoot(coinbaseHash::String, merkleBranches::Array{String})
+    root = coinbaseHash
+    for branch in merkleBranches
+        root = dSHA2(root * branch)
+    end
+    return root
+end
 
 
-#= = = = = = = = = = = = =#
+
+#=========================#
 #=     Block Header      =#
-#= = = = = = = = = = = = =#
+#=========================#
 
 mutable struct BlockHeader
     version::String
@@ -74,6 +83,7 @@ function incrementNonce!(bh::BlockHeader)
     return bh.nonce == 0
 end
 
+# hashes header for evaluation against difficulty
 function hash(bh::BlockHeader)
     s = bh.version *
         bh.prevhash *
@@ -84,8 +94,100 @@ function hash(bh::BlockHeader)
     return dSHA2(s)
 end
 
+#=========================#
+#=         Job           =#
+#=========================#
+
+# A Job contains all the data needed to mine a block,
+# directly from the pool.
+struct Job
+    extranonce1::String
+    extranonce2_size::String
+    difficulty::String
+    job_id::String
+    prevhash::String
+    coinb1::String
+    coinb2::String
+    merkle_branch::Array{String}
+    version::String
+    nbits::String
+    ntime::String
+    clean_jobs::String
+end
 
 
+
+
+#=========================#
+#=    Pool Connection    =#
+#=========================#
+
+# subscibes to the pool, returns the first job
+function subscribe(ip::IPv4, port::Int32)
+    conn = connect(ip, port)
+    write(conn, """{"id": 1, "method": "mining.subscribe", "params": []}\n""")
+    rsp1 = JSON.parse(readline(conn))
+    rsp2 = JSON.parse(readline(conn))
+    rsp3 = JSON.parse(readline(conn))
+    close(conn)
+
+    return Job(
+        rsp1["result"][2],  # extranonce1
+        rsp1["result"][3],  # extranonce2_size
+
+        rsp2["params"][1],  # difficulty
+
+        rsp3["params"][1],  # job_id
+        rsp3["params"][2],  # prevhash
+        rsp3["params"][3],  # coinb1
+        rsp3["params"][4],  # coinb2
+        rsp3["params"][5],  # merkle_branch
+        rsp3["params"][6],  # version
+        rsp3["params"][7],  # nbits
+        rsp3["params"][8],  # ntime
+        rsp3["params"][9])  # clean
+end
+
+function authorize(worker, password)
+    conn = connect(ip, port)
+    write(conn, """{"params": ["$(worker)", "$(password)"], "id": 2, "method": "mining.authorize"}\n""")
+    rsp1 = JSON.parse(readline(conn))
+    if rsp1["error"] != nothing
+        error("Failed to authorize worker $(worker)")
+    else
+        print("Authorized worker $(worker)")
+    end
+    close(conn)
+end
+
+
+
+
+#=========================#
+#=         I / O         =#
+#=========================#
+
+struct Config
+    poolIP::IPv4
+    poolPort::Int32
+    worker::String
+    password::String
+    method::String
+end
+
+function loadConfig(path::String)
+    c = JSON.parsefile(path)
+    return Config(
+        c["poolIP"],
+        c["poolPort"],
+        c["workername"],
+        c["password"],
+        c["method"])
+end
+
+function loadConfig()
+    loadConfig("/config.json")
+end
 
 
 conn = connect(ip"52.19.206.69", 3333)
