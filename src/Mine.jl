@@ -16,34 +16,42 @@ function dSHA2(in::Array{UInt8})
     return bytes2hex(sha256(sha256(in)))
 end
 
-
+# convert big endian to little endian, no builtins!
+function be2le(s)
+    le = ""
+    for i = 0: Int(floor(length(s)/8) - 1)
+        #print(s[i*8+1:(i+1)*8], "\n")
+        le *= num2hex(bswap(hex2num(s[i*8+1:(i+1)*8])))
+    end
+    return le
+end
 
 #=========================#
-#=    Coinbase Block     =#
+#= Coinbase  Transaction =#
 #=========================#
 
-mutable struct CoinbaseBlock
+mutable struct CoinbaseTransaction
     coinb1::String
     extranonce1::String
     extranonce2_size::Int32
     coinb2::String
-    extranonce2
-    CoinbaseBlock(coinb1, extranonce1, extranonce2_size, coinb2) =
+    extranonce2::UInt32
+    CoinbaseTransaction(coinb1, extranonce1, extranonce2_size, coinb2) =
         new(coinb1, extranonce1, extranonce2_size, coinb2, UInt32(0))
 end
 
 # increments without changing type (addition casts to Int64)
 # overflow is impossible for extranonce2
-function incrementNonce!(cb::CoinbaseBlock)
-    cb.extranonce2 = typeof(cb.extranonce2)(cb.extranonce2 + 1)
+function incrementNonce!(cbt::CoinbaseTransaction)
+    cbt.extranonce2 = typeof(cbt.extranonce2)(cbt.extranonce2 + 1)
 end
 
-# hashes CoinbaseBlock for use in calculating Merkle root
-function hash(cb::CoinbaseBlock)
-    s = cb.coinb1 *
-        cb.extranonce1 *
-        hex(cb.extranonce2, cb.extranonce2_size * 2) *
-        cb.coinb2
+# hashes CoinbaseTransaction for use in calculating Merkle root
+function hash(cbt::CoinbaseTransaction)
+    s = cbt.coinb1 *
+        cbt.extranonce1 *
+        hex(cbt.extranonce2, cbt.extranonce2_size * 2) *
+        cbt.coinb2
     return dSHA2(s)
 end
 
@@ -74,25 +82,33 @@ mutable struct BlockHeader
     timestamp::String
     bits::String
     nonce::UInt32
+    BlockHeader(version, prevhash, merkle_root, timestamp, bits) =
+        new(version, prevhash, merkle_root, timestamp, bits, UInt32(0))
 end
 
 # increments the nonce (preserves type)
 # returns true if overflow occured, false otherwise
 function incrementNonce!(bh::BlockHeader)
-    bh.nonce = typeof(bh.extranonce2)(bh.extranonce2 + 1)
+    bh.nonce = typeof(bh.nonce)(bh.nonce + 1)
     return bh.nonce == 0
 end
 
 # hashes header for evaluation against difficulty
 function hash(bh::BlockHeader)
-    s = bh.version *
-        bh.prevhash *
+    s = be2le(bh.version) *
+        be2le(bh.prevhash) *
         bh.merkle_root *
         bh.timestamp *
         bh.bits *
-        hex(bh.nonce, 8)
+        hex(bh.nonce, 8) *                           # pad to 512
+        "000000800000000000000000000000000000000000000000000000000000000000000000000000000000000080020000"
     return dSHA2(s)
+
 end
+
+
+
+
 
 #=========================#
 #=         Job           =#
@@ -102,8 +118,8 @@ end
 # directly from the pool.
 struct Job
     extranonce1::String
-    extranonce2_size::String
-    difficulty::String
+    extranonce2_size::Int32
+    difficulty::Int32
     job_id::String
     prevhash::String
     coinb1::String
@@ -112,7 +128,7 @@ struct Job
     version::String
     nbits::String
     ntime::String
-    clean_jobs::String
+    clean_jobs::Bool
 end
 
 
@@ -148,14 +164,14 @@ function subscribe(ip::IPv4, port::Int32)
         rsp3["params"][9])  # clean
 end
 
-function authorize(worker, password)
+function authorize(ip::IPv4, port::Int32, worker::String, password::String)
     conn = connect(ip, port)
     write(conn, """{"params": ["$(worker)", "$(password)"], "id": 2, "method": "mining.authorize"}\n""")
     rsp1 = JSON.parse(readline(conn))
     if rsp1["error"] != nothing
-        error("Failed to authorize worker $(worker)")
+        error("Failed to authorize worker $(worker)\n")
     else
-        print("Authorized worker $(worker)")
+        print("Authorized worker $(worker)\n")
     end
     close(conn)
 end
@@ -178,7 +194,7 @@ end
 function loadConfig(path::String)
     c = JSON.parsefile(path)
     return Config(
-        c["poolIP"],
+        IPv4(c["poolIP"]),
         c["poolPort"],
         c["workername"],
         c["password"],
@@ -186,62 +202,52 @@ function loadConfig(path::String)
 end
 
 function loadConfig()
-    loadConfig("/config.json")
+    loadConfig("../config.json")
 end
 
 
-conn = connect(ip"52.19.206.69", 3333)
+function main()
 
+    # load configuration
+    config = loadConfig()
 
-write(conn, """{"id": 1, "method": "mining.subscribe", "params": []}\n""")
-rsp1 = JSON.parse(readline(conn))
+    # get job from pool, auth worker
+    job = subscribe(config.poolIP, config.poolPort)
+    authorize(config.poolIP, config.poolPort, config.worker, config.password)
 
-extranonce1 = rsp1["result"][2]
-extranonce2_size = rsp1["result"][3]
-JSON.print(rsp1)
-print("\n\n")
+    # Build coinbase transaction
+    coinbase = CoinbaseTransaction(job.coinb1, job.extranonce1,
+        job.extranonce2_size, job.coinb2)
 
+    # Calculate Merkle root
+    merkleRoot = buildMerkelRoot(hash(coinbase), job.merkle_branch)
 
-rsp2 = JSON.parse(readline(conn))
-JSON.print(rsp2)
-print("\n\n")
+    # construct block header
+    blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
+        job.ntime, job.nbits)
 
+    lowest = hash(blockHeader)
+    lowNonce = blockHeader.nonce
+    print("started mining...\n")
 
-difficulty = rsp2["params"][1]
+    @time for i = 0:1000000
+        h = hash(blockHeader)
+        if h < lowest
+            lowest = h
+            print("new low: $lowest\n")
+            lowNonce = blockHeader.nonce
+        end
+        incrementNonce!(blockHeader)
+    end
 
-rsp3 = JSON.parse(readline(conn))
-JSON.print(rsp3)
-print("\n\n")
-
-job_id = rsp3["params"][1]
-prevhash = rsp3["params"][2]
-coinb1 = rsp3["params"][3]
-coinb2 = rsp3["params"][4]
-merkle_branch = rsp3["params"][5]
-version = rsp3["params"][6]
-nbits = rsp3["params"][7]
-ntime = rsp3["params"][8]
-clean = rsp3["params"][9]
-
-close(conn)
-
-
-#a = 5
-#b = 6
-#c = ccall((:add,"clib/testing"),Int32,(Int32,Int32), a, b)
-
-#print(c)
+    print("low: $lowest\n")
+    print("low nonce: $lowNonce\n")
 
 
 
-#"""{"id": 1, "method": "mining.subscribe", "params": []}\n""".encode()
-"2165060064a4e1"
 
-["465b4",
-"170bcd35afb876afb78b0fcbd8dbd7bb81145ed0001dfbfd0000000000000000",
-extranonce1 = "2165060064a4e1"
-coinb1 = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff450358f107fabe6d6d83822c34eb44c1321d39269d1e6efad4ef2fb54dc8822a5fd872ce87bfbdb0070100000000000000"
-coinb2 = "b465042f736c7573682f00000000038fa6954a000000001976a9147c154ed1dc59609e3d26abb2df2ea3d587cd8c4188ac00000000000000002c6a4c2952534b424c4f434b3aa23547f00d8694cf28ebcb0f1d3796b8b9fa13a4f5dc3be9617e1466ed85a5010000000000000000266a24aa21a9ed0f8cc1e340aa2efc3f40737a191ffab91f2ac747d4550433fa3cb03f05b095c400000000"
-["f05b352c51ed440d902125d0d21fe21ab623d8868f624fc07a56b9a919e725ee","ee8de35e8a0b56c537f5bcbcb319eb44991b5e21383a37877b4bf38f76899171","9340ba09bcdff536551963f08bdb94a4e1a1f39865f76ad3846a280eefd66494","3cc071b9450a37a6bab0e3b6c3d12a9fa1923392ff1d092fedc7e0f75d1f2fa8","3cad0dd64274d34febb78fd6bb719778576fd1a9d9025357f8f2d10ceb21fa3b","ce0b4681f0e9da7ce405f7ac24e22f7b405f405a9b379476516125803c37a856"]
+end
+
+main()
 
 end
