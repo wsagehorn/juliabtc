@@ -93,6 +93,11 @@ function incrementNonce!(bh::BlockHeader)
     return bh.nonce == 0
 end
 
+function incrementNonce_r!(bh::BlockHeader)
+    bh.nonce = typeof(bh.nonce)(bh.nonce + 1)
+    return bh
+end
+
 # hashes header for evaluation against difficulty
 function hash(bh::BlockHeader)
     s = be2le(bh.version) *
@@ -105,7 +110,6 @@ function hash(bh::BlockHeader)
     return dSHA2(s)
 
 end
-
 
 
 
@@ -168,11 +172,12 @@ function authorize(ip::IPv4, port::Int32, worker::String, password::String)
     conn = connect(ip, port)
     write(conn, """{"params": ["$(worker)", "$(password)"], "id": 2, "method": "mining.authorize"}\n""")
     rsp1 = JSON.parse(readline(conn))
-    if rsp1["error"] != nothing
-        error("Failed to authorize worker $(worker)\n")
-    else
-        print("Authorized worker $(worker)\n")
-    end
+    #if rsp1["error"] != nothing
+        #error("Failed to authorize worker $(worker)\n")
+    #else
+        #printing is not thread safe :(
+        #print("Authorized worker $(worker)\n")
+    #end
     close(conn)
 end
 
@@ -206,7 +211,7 @@ function loadConfig()
 end
 
 
-function main()
+function mine_sequential(iterations)
 
     # load configuration
     config = loadConfig()
@@ -226,28 +231,153 @@ function main()
     blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
         job.ntime, job.nbits)
 
-    lowest = hash(blockHeader)
-    lowNonce = blockHeader.nonce
-    print("started mining...\n")
+    validCount = 0
 
-    @time for i = 0:1000000
+
+    tic()
+    for i = 0:iterations
         h = hash(blockHeader)
-        if h < lowest
-            lowest = h
-            print("new low: $lowest\n")
-            lowNonce = blockHeader.nonce
+        if h < "0000ffff"#"00000000ffff"
+            validCount += 1
         end
-        incrementNonce!(blockHeader)
+        if incrementNonce!(blockHeader)
+            # increment extranonce2 and rebuild block
+            incrementNonce(coinbase)
+            merkleRoot = buildMerkelRoot(hash(coinbase), job.merkle_branch)
+            blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
+                job.ntime, job.nbits)
+        end
+
+    end
+    elapsedTime = toq()
+
+
+    return elapsedTime
+end
+
+
+function mine_fine(iterations)
+
+    # load configuration
+    config = loadConfig()
+
+    # get job from pool, auth worker
+    job = subscribe(config.poolIP, config.poolPort)
+    authorize(config.poolIP, config.poolPort, config.worker, config.password)
+
+    # Build coinbase transaction
+    coinbase = CoinbaseTransaction(job.coinb1, job.extranonce1,
+        job.extranonce2_size, job.coinb2)
+
+    # Calculate Merkle root
+    merkleRoot = buildMerkelRoot(hash(coinbase), job.merkle_branch)
+
+    # construct block header
+    blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
+        job.ntime, job.nbits)
+
+    # make our valid count thread-safe
+    validCount = Threads.Atomic{Int}(0)
+
+    tic()
+    Threads.@threads for i = 0:iterations
+        if check_nonce(i, blockHeader::BlockHeader)
+            Threads.atomic_add!(validCount, 1)
+        end
+    end
+    elapsedTime = toq()
+
+    return elapsedTime
+end
+
+function check_nonce(nonce, blockHeader::BlockHeader)
+    blockHeader.nonce = nonce
+    h = hash(blockHeader)
+    if h < "0000ffff"
+        return true
+    end
+    return false
+end
+
+function mine_coarse(iterations)
+    # load configuration
+    config = loadConfig()
+
+    jobs = Array{Job}(Threads.nthreads())
+    elapsedTime = Array{Float64}(Threads.nthreads())
+
+    for i = 1:Threads.nthreads()
+        jobs[i] = subscribe(config.poolIP, config.poolPort)
+        #elapsedTime[Threads.threadid()] = i
     end
 
-    print("low: $lowest\n")
-    print("low nonce: $lowNonce\n")
+    # divide iterations among worker threads, each with their own job
+    Threads.@threads for i = 1:Threads.nthreads()
+        elapsedTime[Threads.threadid()] = mine_job(jobs[Threads.threadid()],
+            iterations/Threads.nthreads())
+    end
+    return maximum(elapsedTime)
+end
 
 
+function mine_job(job::Job, iterations)
+    #authorize(poolIP, poolPort, worker, password)
+    # parallel authorizes blows up and segfaults
 
+    # Build coinbase transaction
+    coinbase = CoinbaseTransaction(job.coinb1, job.extranonce1,
+        job.extranonce2_size, job.coinb2)
+
+    # Calculate Merkle root
+    merkleRoot = buildMerkelRoot(hash(coinbase), job.merkle_branch)
+
+    # construct block header
+    blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
+        job.ntime, job.nbits)
+
+    tic()
+    for i = 0:iterations
+        h = hash(blockHeader)
+        #if h < "0000ffff" #"00000000ffff"
+            #validCount += 1
+        #end
+        if incrementNonce!(blockHeader)
+            # increment extranonce2 and rebuild block
+            incrementNonce(coinbase)
+            merkleRoot = buildMerkelRoot(hash(coinbase), job.merkle_branch)
+            blockHeader = BlockHeader(job.version, job.prevhash, merkleRoot,
+                job.ntime, job.nbits)
+        end
+    end
+    return toq()
 
 end
 
+
+function main()
+
+    iterations = 100000
+
+    print("Warming up...\n")
+    mine_sequential(1000)
+    mine_fine(1000)
+    mine_coarse(1000)
+    print("Warmed up.\n")
+
+    print("Currently using $(Threads.nthreads()) thread(s)\n")
+
+    print("Checking $(iterations) hashes sequentially...\n")
+    elapsedTime = mine_sequential(iterations)
+    print("Took $(elapsedTime)s, avg $(iterations/elapsedTime/1000)Kh/s\n\n")
+
+    print("Checking $(iterations) hashes using fine grained parallelism...\n")
+    elapsedTime = mine_fine(iterations)
+    print("Took $(elapsedTime)s, avg $(iterations/elapsedTime/1000)Kh/s\n\n")
+
+    print("Checking $(iterations) hashes using coarse grained parallelism...\n")
+    elapsedTime = mine_coarse(iterations)
+    print("Took $(elapsedTime)s, avg $(iterations/elapsedTime/1000)Kh/s\n\n")
+end
 main()
 
 end
